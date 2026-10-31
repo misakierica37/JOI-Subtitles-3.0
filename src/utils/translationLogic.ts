@@ -929,3 +929,87 @@ if command -v wmctrl >/dev/null 2>&1; then
 fi
 `;
 }
+
+export function computeRmsLevel(samples: Float32Array): number {
+  if (!samples || samples.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    sumSq += s * s;
+  }
+  return Math.sqrt(sumSq / samples.length);
+}
+
+/**
+ * Resamples Float32 mono audio from any hardware sample rate (e.g. 48000Hz or 44100Hz on Linux Mint)
+ * to 16000Hz and encodes into a complete, standards-compliant 16-bit RIFF WAV byte array.
+ * Also applies gentle auto-gain normalization for quiet laptop microphones.
+ */
+export function encodePcmToWav(
+  samples: Float32Array,
+  inputSampleRate = 16000,
+  targetSampleRate = 16000
+): Uint8Array {
+  let processed = samples;
+  const safeInRate = inputSampleRate > 0 ? inputSampleRate : 16000;
+  const safeOutRate = targetSampleRate > 0 ? targetSampleRate : 16000;
+
+  if (safeInRate !== safeOutRate && samples.length > 0) {
+    const ratio = safeInRate / safeOutRate;
+    const newLength = Math.max(1, Math.round(samples.length / ratio));
+    const resampled = new Float32Array(newLength);
+    for (let i = 0; i < newLength; i++) {
+      const srcIndex = i * ratio;
+      const idx0 = Math.floor(srcIndex);
+      const idx1 = Math.min(samples.length - 1, idx0 + 1);
+      const frac = srcIndex - idx0;
+      resampled[i] = samples[idx0] * (1 - frac) + samples[idx1] * frac;
+    }
+    processed = resampled;
+  }
+
+  // Find peak amplitude to boost quiet Linux laptop microphones without clipping
+  let peak = 0;
+  for (let i = 0; i < processed.length; i++) {
+    const abs = Math.abs(processed[i]);
+    if (abs > peak) peak = abs;
+  }
+  const gain = peak > 0.002 && peak < 0.45 ? Math.min(6.0, 0.75 / peak) : 1.0;
+
+  const numSamples = processed.length;
+  const byteLength = 44 + numSamples * 2;
+  const buffer = new ArrayBuffer(byteLength);
+  const view = new DataView(buffer);
+
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + numSamples * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
+  view.setUint16(20, 1, true); // AudioFormat (1 = PCM)
+  view.setUint16(22, 1, true); // NumChannels (1 = mono)
+  view.setUint32(24, safeOutRate, true);
+  view.setUint32(28, safeOutRate * 2, true); // ByteRate
+  view.setUint16(32, 2, true); // BlockAlign
+  view.setUint16(34, 16, true); // BitsPerSample
+  writeStr(36, 'data');
+  view.setUint32(40, numSamples * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    const clamped = Math.max(-1, Math.min(1, processed[i] * gain));
+    const int16 = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    view.setInt16(offset, int16, true);
+    offset += 2;
+  }
+
+  return new Uint8Array(buffer);
+}
+
+

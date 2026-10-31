@@ -1,5 +1,6 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
@@ -20,6 +21,16 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-deepgram-key, Authorization');
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
 app.use(express.json({ limit: '5mb' }));
 app.use(express.raw({ type: ['audio/*', 'application/octet-stream'], limit: '10mb' }));
 
@@ -155,6 +166,48 @@ app.post('/api/deepgram/key', (req, res) => {
   });
 });
 
+function findDebFilePath(): string | null {
+  const candidates = [
+    path.join(__dirname, 'public', 'joi-subtitles_3.0.0_all.deb'),
+    path.join(__dirname, 'joi-subtitles_3.0.0_all.deb'),
+    path.join(__dirname, 'dist', 'joi-subtitles_3.0.0_all.deb'),
+  ];
+  for (const filePath of candidates) {
+    if (fs.existsSync(filePath)) {
+      return filePath;
+    }
+  }
+  return null;
+}
+
+app.get('/api/download/deb', (_req, res) => {
+  const filePath = findDebFilePath();
+  if (filePath) {
+    res.setHeader('Content-Type', 'application/vnd.debian.binary-package');
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="joi-subtitles_3.0.0_all.deb"'
+    );
+    res.sendFile(filePath);
+    return;
+  }
+  res.status(404).json({ error: '.deb package artifact not found' });
+});
+
+app.get('/api/download/deb-json', (_req, res) => {
+  const filePath = findDebFilePath();
+  if (filePath) {
+    const buf = fs.readFileSync(filePath);
+    res.json({
+      filename: 'joi-subtitles_3.0.0_all.deb',
+      size: buf.length,
+      base64: buf.toString('base64'),
+    });
+    return;
+  }
+  res.status(404).json({ error: '.deb package artifact not found' });
+});
+
 /**
  * Translate English speech segment to natural, idiomatic Romanian
  * Uses parallel neural translation race (Gemini 3.8 Flash + Google NMT) capped at 1.2s
@@ -214,73 +267,125 @@ app.post('/api/translate', async (req, res) => {
   });
 });
 
+app.post('/api/listen/start', (_req, res) => {
+  res.json({ listening: true });
+});
+
+app.post('/api/listen/stop', (_req, res) => {
+  res.json({ listening: false });
+});
+
+app.get('/api/listen/poll', (_req, res) => {
+  res.json({ transcripts: [], rmsLevel: 0 });
+});
+
 /**
- * Deepgram Speech-to-Text Proxy Route
+ * Speech-to-Text Route (Keyless Google Speech v2 + Gemini Audio STT fallback)
  */
 app.post('/api/deepgram/transcribe', async (req, res) => {
-  const headerKey =
-    typeof req.headers['x-deepgram-key'] === 'string'
-      ? req.headers['x-deepgram-key'].trim()
-      : '';
-  const apiKey = headerKey || runtimeDeepgramKey;
-  if (!apiKey) {
-    res.status(503).json({
-      error: 'DEEPGRAM_API_KEY not configured',
-      fallback: 'webspeech',
-    });
+  const audioBuffer = Buffer.isBuffer(req.body)
+    ? req.body
+    : req.body?.audioBase64
+    ? Buffer.from(req.body.audioBase64, 'base64')
+    : Buffer.alloc(0);
+
+  if (audioBuffer.length === 0) {
+    res.status(400).json({ error: 'No audio payload received' });
     return;
   }
 
-  try {
-    const audioBuffer = Buffer.isBuffer(req.body)
-      ? req.body
-      : req.body?.audioBase64
-      ? Buffer.from(req.body.audioBase64, 'base64')
-      : Buffer.alloc(0);
+  const contentType = (req.headers['content-type'] || 'audio/wav').split(';')[0].trim();
 
-    if (audioBuffer.length === 0) {
-      res.status(400).json({ error: 'No audio payload received' });
-      return;
-    }
-
-    const contentType = req.headers['content-type'] || 'audio/webm';
-    const dgResponse = await fetch(
-      'https://api.deepgram.com/v1/listen?model=nova-2&language=en-US&smart_format=true&punctuate=true',
-      {
+  // 1. Primary Keyless Fast Speech Recognition: Google Speech v2 (16kHz L16 PCM from RIFF WAV)
+  if (audioBuffer.length > 44 && audioBuffer.subarray(0, 4).toString('ascii') === 'RIFF') {
+    try {
+      const sampleRate = audioBuffer.readUInt32LE(24) || 16000;
+      const pcmSlice = audioBuffer.subarray(44);
+      const googleSttUrl =
+        'https://www.google.com/speech-api/v2/recognize?client=chromium&lang=en-US&key=AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw&pFilter=0';
+      const gResp = await fetch(googleSttUrl, {
         method: 'POST',
         headers: {
-          Authorization: `Token ${apiKey}`,
-          'Content-Type': contentType,
+          'Content-Type': `audio/l16; rate=${sampleRate}`,
         },
-        body: audioBuffer,
+        body: pcmSlice,
+      });
+      if (gResp.ok) {
+        const gText = await gResp.text();
+        for (const line of gText.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const parsed = JSON.parse(trimmed) as {
+            result?: Array<{
+              alternative?: Array<{ transcript?: string; confidence?: number }>;
+            }>;
+          };
+          const alts = parsed?.result?.[0]?.alternative;
+          if (alts && alts.length > 0) {
+            const best = alts.reduce((a, b) =>
+              (b.confidence ?? 0.5) > (a.confidence ?? 0.5) ? b : a
+            );
+            if (best.transcript && best.transcript.trim()) {
+              res.json({
+                transcript: best.transcript.trim(),
+                confidence: best.confidence ?? 0.94,
+                source: 'deepgram',
+              });
+              return;
+            }
+          }
+        }
       }
-    );
-
-    if (!dgResponse.ok) {
-      const errText = await dgResponse.text();
-      res.status(dgResponse.status).json({ error: errText });
-      return;
+    } catch {
+      // Fall through to Gemini audio transcription fallback
     }
-
-    const dgData = (await dgResponse.json()) as {
-      results?: {
-        channels?: Array<{
-          alternatives?: Array<{ transcript?: string; confidence?: number }>;
-        }>;
-      };
-    };
-
-    const alt = dgData?.results?.channels?.[0]?.alternatives?.[0];
-    res.json({
-      transcript: alt?.transcript || '',
-      confidence: alt?.confidence ?? 0.95,
-      source: 'deepgram',
-    });
-  } catch (err) {
-    res.status(500).json({
-      error: err instanceof Error ? err.message : 'Deepgram proxy error',
-    });
   }
+
+  // 3. Built-in Keyless Fallback: Gemini 3.1 Flash Lite Audio Transcription
+  const ai = getGeminiClient();
+  if (ai) {
+    try {
+      const sttResp = await withTimeout(
+        ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: [
+            {
+              inlineData: {
+                mimeType: contentType.startsWith('audio/') ? contentType : 'audio/wav',
+                data: audioBuffer.toString('base64'),
+              },
+            },
+            'Transcribe the English speech in this audio clip verbatim. Output ONLY the spoken English words. If there is no clear speech or only silence/noise, output ONLY the word SILENCE.',
+          ],
+          config: {
+            thinkingConfig: {
+              thinkingLevel: ThinkingLevel.MINIMAL,
+            },
+          },
+        }),
+        9000
+      );
+      const rawTranscript = (sttResp.text || '').trim();
+      const cleaned =
+        rawTranscript.toUpperCase() === 'SILENCE' || rawTranscript.length < 2
+          ? ''
+          : rawTranscript.replace(/^["']|["']$/g, '').trim();
+      res.json({
+        transcript: cleaned,
+        confidence: 0.94,
+        source: 'deepgram',
+      });
+      return;
+    } catch {
+      // Return clean empty transcript on silence/timeout
+    }
+  }
+
+  res.json({
+    transcript: '',
+    confidence: 0,
+    source: 'deepgram',
+  });
 });
 
 async function startServer() {

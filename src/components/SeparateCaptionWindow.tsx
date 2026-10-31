@@ -27,14 +27,41 @@ export const SeparateCaptionWindow: React.FC<SeparateCaptionWindowProps> = ({
   onChangeFontSize,
   bgOpacity,
 }) => {
-  const [pos, setPos] = useState<{ x: number; y: number }>({ x: 200, y: 675 });
+  // null = docked safely at bottom-center of the visible viewport (never off-screen on 1366x768 laptops)
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const windowRef = useRef<HTMLDivElement | null>(null);
   const dragOffset = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
 
   // Offscreen Canvas & Video for OS-level Always-on-Top PiP window on Linux Mint
   const pipCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const pipVideoRef = useRef<HTMLVideoElement | null>(null);
   const [isPipActive, setIsPipActive] = useState(false);
+  const [firefoxVideoMode, setFirefoxVideoMode] = useState(false);
+
+  // Whenever the caption window is opened, reset position to safe bottom-center of viewport
+  useEffect(() => {
+    if (isOpen) {
+      setPos(null);
+    }
+  }, [isOpen]);
+
+  // Keep dragged window inside viewport if browser window is resized
+  useEffect(() => {
+    const handleResize = () => {
+      setPos((prev) => {
+        if (!prev) return null;
+        const elWidth = windowRef.current?.offsetWidth || 600;
+        const elHeight = windowRef.current?.offsetHeight || 150;
+        return {
+          x: Math.max(12, Math.min(window.innerWidth - elWidth - 12, prev.x)),
+          y: Math.max(12, Math.min(window.innerHeight - elHeight - 12, prev.y)),
+        };
+      });
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   const paintPipCanvas = useCallback(() => {
     const canvas = pipCanvasRef.current;
@@ -111,11 +138,23 @@ export const SeparateCaptionWindow: React.FC<SeparateCaptionWindowProps> = ({
       const canvas = pipCanvasRef.current;
       const video = pipVideoRef.current;
       if (!canvas || !video) return;
-      const stream = canvas.captureStream(5);
-      video.srcObject = stream;
-      await video.play();
-      await video.requestPictureInPicture();
-      setIsPipActive(true);
+      const stream = (canvas as any).captureStream
+        ? canvas.captureStream(10)
+        : (canvas as any).mozCaptureStream
+          ? (canvas as any).mozCaptureStream(10)
+          : null;
+      if (stream) {
+        video.srcObject = stream;
+        await video.play();
+      }
+      if (typeof (video as any).requestPictureInPicture === 'function') {
+        await (video as any).requestPictureInPicture();
+        setIsPipActive(true);
+      } else {
+        // Firefox fallback: reveal the live video stream so Firefox's native PiP toggle button can be clicked
+        setFirefoxVideoMode((prev) => !prev);
+        setIsPipActive((prev) => !prev);
+      }
     } catch {
       // Ignore if PiP is restricted in automated test environment
     }
@@ -126,39 +165,67 @@ export const SeparateCaptionWindow: React.FC<SeparateCaptionWindowProps> = ({
   const plateBg =
     bgOpacity <= 0.01 ? 'transparent' : hexToRgba('#062422', bgOpacity);
 
+  const positionStyle: React.CSSProperties = pos
+    ? {
+        left: `${pos.x}px`,
+        top: `${pos.y}px`,
+        backgroundColor: plateBg,
+      }
+    : {
+        left: '50%',
+        bottom: '20px',
+        transform: 'translateX(-50%)',
+        backgroundColor: plateBg,
+      };
+
   return (
     <>
       <canvas ref={pipCanvasRef} width={960} height={180} className="hidden" aria-hidden="true" />
-      <video ref={pipVideoRef} muted playsInline className="hidden" />
+      <video
+        ref={pipVideoRef}
+        muted
+        playsInline
+        controls={firefoxVideoMode}
+        className={
+          firefoxVideoMode
+            ? 'fixed bottom-44 left-1/2 -translate-x-1/2 z-50 w-[min(640px,calc(100vw-32px))] rounded-xl border-2 border-teal-400 shadow-lg bg-[#0B2220]'
+            : 'hidden'
+        }
+      />
 
       <div
+        ref={windowRef}
         role="region"
         aria-label="Separate Live Captioning Window"
         data-testid="separate-caption-window"
-        style={{
-          left: `${pos.x}px`,
-          top: `${pos.y}px`,
-          backgroundColor: plateBg,
-        }}
+        style={positionStyle}
         onPointerMove={(e) => {
           if (!isDragging) return;
+          const elWidth = windowRef.current?.offsetWidth || 360;
+          const elHeight = windowRef.current?.offsetHeight || 140;
           setPos({
-            x: Math.max(12, Math.min(window.innerWidth - 360, e.clientX - dragOffset.current.dx)),
-            y: Math.max(12, Math.min(window.innerHeight - 140, e.clientY - dragOffset.current.dy)),
+            x: Math.max(12, Math.min(window.innerWidth - Math.min(elWidth, window.innerWidth - 24), e.clientX - dragOffset.current.dx)),
+            y: Math.max(12, Math.min(window.innerHeight - Math.min(elHeight, window.innerHeight - 24), e.clientY - dragOffset.current.dy)),
           });
         }}
         onPointerUp={() => setIsDragging(false)}
-        className="fixed z-50 w-[min(1040px,calc(100vw-32px))] rounded-2xl border-2 border-teal-700/40 transition-colors"
+        className="fixed z-50 w-[min(1040px,calc(100vw-32px))] rounded-2xl border-2 border-teal-700/60 shadow-lg transition-colors"
       >
         {/* Minimal Window Header Bar */}
         <div
           onPointerDown={(e) => {
             if ((e.target as HTMLElement).closest('button')) return;
+            const rect = windowRef.current?.getBoundingClientRect();
+            const startX = rect ? rect.left : pos?.x ?? 20;
+            const startY = rect ? rect.top : pos?.y ?? Math.max(20, window.innerHeight - 180);
+            if (!pos) {
+              setPos({ x: startX, y: startY });
+            }
             e.currentTarget.setPointerCapture(e.pointerId);
             setIsDragging(true);
             dragOffset.current = {
-              dx: e.clientX - pos.x,
-              dy: e.clientY - pos.y,
+              dx: e.clientX - startX,
+              dy: e.clientY - startY,
             };
           }}
           className="flex items-center justify-between gap-4 px-4 py-2 rounded-t-xl bg-[#0B3B38] text-teal-50 cursor-move select-none"

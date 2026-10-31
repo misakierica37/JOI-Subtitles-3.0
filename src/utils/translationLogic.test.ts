@@ -18,6 +18,8 @@ import {
   formatSrtTimestamp,
   generateSrtSubtitles,
   generateLinuxMintLauncherScript,
+  encodePcmToWav,
+  computeRmsLevel,
   DEFAULT_CUSTOMIZATION,
   type TranscriptSegment,
 } from './translationLogic';
@@ -169,3 +171,16 @@ test('Linux Mint Always-on-Top script generator outputs wmctrl command', () => {
   assert.ok(script.includes('add,above,sticky'));
   assert.ok(script.includes('http://localhost:3000/?overlay=1'));
 });
+
+test('encodePcmToWav generates valid 44-byte RIFF WAVE header and 16-bit PCM payload', () => {
+  const samples = new Float32Array([0, 0.5, -0.5, 1.0]);
+  const wav = encodePcmToWav(samples, 16000);
+  assert.equal(wav.byteLength, 44 + 4 * 2);
+  const riffHeader = String.fromCharCode(wav[0], wav[1], wav[2], wav[3]);
+  const waveHeader = String.fromCharCode(wav[8], wav[9], wav[10], wav[11]);
+  assert.equal(riffHeader, 'RIFF');
+  assert.equal(waveHeader, 'WAVE');
+  const rms = computeRmsLevel(samples);
+  assert.ok(rms > 0.5 && rms < 0.7);
+});
+

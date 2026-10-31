@@ -1,18 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, Square, Key, AppWindow, Send, Check, Download } from 'lucide-react';
+import { Mic, Square, AppWindow, Send } from 'lucide-react';
 import {
   type TranscriptSegment,
   DEFAULT_CUSTOMIZATION,
   TranslationLruCache,
   appendTranscriptSegment,
   normalizeSpeechChunk,
+  encodePcmToWav,
+  computeRmsLevel,
+  fallbackEnglishToRomanian,
 } from './utils/translationLogic';
 import { SeparateCaptionWindow } from './components/SeparateCaptionWindow';
-
-interface BeforeInstallPromptEvent extends Event {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
-}
 
 export interface AudioInputDevice {
   deviceId: string;
@@ -52,25 +50,11 @@ const INITIAL_SEGMENTS: TranscriptSegment[] = [
   },
 ];
 
-const DEMO_SPEECH_CUES = [
-  'Good morning everyone and welcome to our conference.',
-  'Our main goal is to deliver reliable real-time subtitles on lightweight Linux hardware.',
-  'By combining Deepgram speech recognition with neural translation, latency stays under one second.',
-  'Can everyone in the back row read the subtitles clearly?',
-  'Thank you for your attention, and let us open the floor for questions and discussion.',
-];
-
 export default function App() {
   const [isListening, setIsListening] = useState<boolean>(false);
   const [isTranslating, setIsTranslating] = useState<boolean>(false);
   const [isCaptionWindowOpen, setIsCaptionWindowOpen] = useState<boolean>(true);
-  const [isApiKeyPanelOpen, setIsApiKeyPanelOpen] = useState<boolean>(false);
-
-  const [deepgramApiKey, setDeepgramApiKey] = useState<string>('');
-  const [apiKeySavedMsg, setApiKeySavedMsg] = useState<boolean>(false);
-  const [hasServerKey, setHasServerKey] = useState<boolean>(false);
-  const [deferredPwaPrompt, setDeferredPwaPrompt] = useState<BeforeInstallPromptEvent | null>(null);
-  const [isStandaloneInstalled, setIsStandaloneInstalled] = useState<boolean>(false);
+  const [micLevel, setMicLevel] = useState<number>(0);
 
   // Microphone selection state
   const [microphones, setMicrophones] = useState<AudioInputDevice[]>(DEFAULT_FALLBACK_MICS);
@@ -91,94 +75,14 @@ export default function App() {
 
   const clientCacheRef = useRef(new TranslationLruCache(250));
   const sessionStartMsRef = useRef<number>(Date.now() - 10000);
+  const isListeningRef = useRef<boolean>(false);
   const recognitionRef = useRef<any>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const demoTimerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const standalone =
-      window.matchMedia('(display-mode: standalone)').matches ||
-      (window.navigator as unknown as { standalone?: boolean }).standalone === true;
-    setIsStandaloneInstalled(standalone);
-
-    const onBeforeInstall = (e: Event) => {
-      e.preventDefault();
-      setDeferredPwaPrompt(e as BeforeInstallPromptEvent);
-    };
-    const onInstalled = () => {
-      setIsStandaloneInstalled(true);
-      setDeferredPwaPrompt(null);
-    };
-    window.addEventListener('beforeinstallprompt', onBeforeInstall);
-    window.addEventListener('appinstalled', onInstalled);
-    return () => {
-      window.removeEventListener('beforeinstallprompt', onBeforeInstall);
-      window.removeEventListener('appinstalled', onInstalled);
-    };
-  }, []);
-
-  const handleInstallStandaloneApp = async () => {
-    if (deferredPwaPrompt) {
-      await deferredPwaPrompt.prompt();
-      const { outcome } = await deferredPwaPrompt.userChoice;
-      if (outcome === 'accepted') {
-        setIsStandaloneInstalled(true);
-        setDeferredPwaPrompt(null);
-        return;
-      }
-    }
-    // Download the self-contained Linux Mint standalone installer script (.sh)
-    const appOrigin =
-      typeof window !== 'undefined'
-        ? window.location.origin
-        : 'https://ais-pre-qctleytd22ucn4li4oik5s-401889023177.europe-west2.run.app';
-    const installerScript = `#!/usr/bin/env bash
-# JOI Subtitles 3.0 — One-Step Standalone Installer for Linux Mint (Celeron N2940 4GB)
-set -e
-echo "Installing JOI Subtitles 3.0 Standalone Desktop App..."
-sudo apt-get update -y && sudo apt-get install -y nodejs npm wmctrl xdotool curl
-mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
-
-cat << 'EOF' > "$HOME/.local/bin/joi-subtitles"
-#!/usr/bin/env bash
-URL="${appOrigin}"
-for bin in chromium-browser chromium google-chrome-stable brave-browser firefox; do
-  if command -v "$bin" >/dev/null 2>&1; then
-    "$bin" --app="$URL" --window-size=1020,760 --disable-extensions --renderer-process-limit=2 &
-    break
-  fi
-done
-sleep 2
-command -v wmctrl >/dev/null 2>&1 && wmctrl -r "JOI Subtitles 3.0" -b add,above,sticky || true
-EOF
-chmod +x "$HOME/.local/bin/joi-subtitles"
-
-cat << EOF > "$HOME/.local/share/applications/joi-subtitles-3.desktop"
-[Desktop Entry]
-Version=3.0
-Type=Application
-Name=JOI Subtitles 3.0
-Comment=Live English Speech to Romanian Text Subtitles
-Exec=$HOME/.local/bin/joi-subtitles
-Icon=audio-input-microphone
-Terminal=false
-Categories=AudioVideo;Utility;
-EOF
-chmod +x "$HOME/.local/share/applications/joi-subtitles-3.desktop"
-[ -d "$HOME/Desktop" ] && cp "$HOME/.local/share/applications/joi-subtitles-3.desktop" "$HOME/Desktop/JOI-Subtitles-3.0.desktop" && chmod +x "$HOME/Desktop/JOI-Subtitles-3.0.desktop"
-echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Application Menu."
-`;
-    const blob = new Blob([installerScript], { type: 'text/x-shellscript;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'install-joi-subtitles.sh';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const nativePollTimerRef = useRef<number | null>(null);
+  const webSpeechDeliveredRef = useRef<number>(0);
 
   const loadAudioDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -210,17 +114,6 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
     }
   }, [loadAudioDevices]);
 
-  useEffect(() => {
-    fetch('/api/status')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (data?.deepgramConfigured) {
-          setHasServerKey(true);
-        }
-      })
-      .catch(() => {});
-  }, []);
-
   const translateEnglishSpeech = useCallback(
     async (
       rawEnglish: string,
@@ -234,57 +127,62 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
       setInterimEnglish('');
       const startReq = Date.now();
 
-      const cachedRo = clientCacheRef.current.get(normalized);
-      if (cachedRo) {
-        setCurrentRomanian(cachedRo);
+      const commitTranslation = (
+        romanianText: string,
+        isCached: boolean,
+        latency: number
+      ) => {
+        clientCacheRef.current.set(normalized, romanianText);
+        setCurrentRomanian(romanianText);
         const nowOffset = Date.now() - sessionStartMsRef.current;
         const newSeg: TranscriptSegment = {
           id: `seg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           english: normalized,
-          romanian: cachedRo,
-          startTimeMs: Math.max(0, nowOffset - 2000),
+          romanian: romanianText,
+          startTimeMs: Math.max(0, nowOffset - 2200),
           endTimeMs: nowOffset,
           confidence,
           source,
-          cached: true,
-          latencyMs: 1,
+          cached: isCached,
+          latencyMs: latency,
         };
         setSegments((prev) => appendTranscriptSegment(prev, newSeg, 25).visibleSegments);
+      };
+
+      const cachedRo = clientCacheRef.current.get(normalized);
+      if (cachedRo) {
+        commitTranslation(cachedRo, true, 1);
         return;
       }
 
       setIsTranslating(true);
       try {
-        const res = await fetch('/api/translate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: normalized }),
-        });
-        if (res.ok) {
-          const data = (await res.json()) as {
-            romanian: string;
-            cached: boolean;
-            latencyMs: number;
-          };
-          clientCacheRef.current.set(normalized, data.romanian);
-          setCurrentRomanian(data.romanian);
-
-          const nowOffset = Date.now() - sessionStartMsRef.current;
-          const newSeg: TranscriptSegment = {
-            id: `seg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            english: normalized,
-            romanian: data.romanian,
-            startTimeMs: Math.max(0, nowOffset - 2200),
-            endTimeMs: nowOffset,
-            confidence,
-            source,
-            cached: Boolean(data.cached),
-            latencyMs: data.latencyMs || Math.max(1, Date.now() - startReq),
-          };
-          setSegments((prev) => appendTranscriptSegment(prev, newSeg, 25).visibleSegments);
+        try {
+          const res = await fetch('/api/translate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: normalized }),
+          });
+          if (res.ok) {
+            const data = (await res.json()) as {
+              romanian?: string;
+              cached?: boolean;
+              latencyMs?: number;
+            };
+            if (data?.romanian) {
+              commitTranslation(
+                data.romanian,
+                Boolean(data.cached),
+                data.latencyMs || Math.max(1, Date.now() - startReq)
+              );
+              return;
+            }
+          }
+        } catch {
+          // Fall through to local Romanian fallback
         }
-      } catch {
-        // Ignore network error
+        const localRo = fallbackEnglishToRomanian(normalized);
+        commitTranslation(localRo, false, Math.max(1, Date.now() - startReq));
       } finally {
         setIsTranslating(false);
       }
@@ -293,83 +191,128 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
   );
 
   const handleStopListening = useCallback(() => {
+    isListeningRef.current = false;
     setIsListening(false);
     setInterimEnglish('');
+    setMicLevel(0);
+
+    if (nativePollTimerRef.current !== null) {
+      window.clearInterval(nativePollTimerRef.current);
+      nativePollTimerRef.current = null;
+    }
+
+    fetch('/api/listen/stop', { method: 'POST' }).catch(() => {});
+
     if (recognitionRef.current) {
       try {
+        recognitionRef.current.onend = null;
         recognitionRef.current.stop();
       } catch {}
       recognitionRef.current = null;
     }
-    if (mediaRecorderRef.current) {
+
+    if (processorNodeRef.current) {
       try {
-        if (mediaRecorderRef.current.state !== 'inactive') {
-          mediaRecorderRef.current.stop();
-        }
-        mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
+        processorNodeRef.current.onaudioprocess = null;
+        processorNodeRef.current.disconnect();
       } catch {}
-      mediaRecorderRef.current = null;
+      processorNodeRef.current = null;
     }
-    if (demoTimerRef.current) {
-      window.clearInterval(demoTimerRef.current);
-      demoTimerRef.current = null;
+
+    if (sourceNodeRef.current) {
+      try {
+        sourceNodeRef.current.disconnect();
+      } catch {}
+      sourceNodeRef.current = null;
+    }
+
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close();
+      } catch {}
+      audioContextRef.current = null;
+    }
+
+    if (mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      } catch {}
+      mediaStreamRef.current = null;
     }
   }, []);
 
   const handleStartListening = useCallback(async () => {
-    if (isListening) return;
+    if (isListeningRef.current) return;
+    isListeningRef.current = true;
     setIsListening(true);
     setIsCaptionWindowOpen(true);
+    setInterimEnglish('Listening for English speech...');
 
-    const activeKey = deepgramApiKey.trim();
-    const audioConstraint: boolean | MediaTrackConstraints =
-      selectedMicId && selectedMicId !== 'default'
-        ? { deviceId: { ideal: selectedMicId } }
-        : true;
-
-    if (navigator.mediaDevices?.getUserMedia) {
+    // CRITICAL FOR FIREFOX: Create and resume AudioContext synchronously inside the click gesture
+    // BEFORE awaiting navigator.mediaDevices.getUserMedia() so Firefox never leaves AudioContext suspended!
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    let preCreatedAudioCtx: AudioContext | null = null;
+    if (AudioCtx) {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint });
-        await loadAudioDevices();
-
-        if (activeKey || hasServerKey) {
-          const recorder = new MediaRecorder(stream);
-          mediaRecorderRef.current = recorder;
-
-          recorder.ondataavailable = async (evt) => {
-            if (evt.data && evt.data.size > 500) {
-              try {
-                const headers: Record<string, string> = {
-                  'Content-Type': evt.data.type || 'audio/webm',
-                };
-                if (activeKey) {
-                  headers['x-deepgram-key'] = activeKey;
-                }
-                const resp = await fetch('/api/deepgram/transcribe', {
-                  method: 'POST',
-                  headers,
-                  body: evt.data,
-                });
-                if (resp.ok) {
-                  const dg = await resp.json();
-                  if (dg.transcript?.trim()) {
-                    translateEnglishSpeech(dg.transcript, 'deepgram', dg.confidence ?? 0.98);
-                  }
-                }
-              } catch {}
-            }
-          };
-          recorder.start(2000);
-          return;
-        } else {
-          // Release test stream if falling back to Web Speech API
-          stream.getTracks().forEach((t) => t.stop());
+        preCreatedAudioCtx = new AudioCtx();
+        audioContextRef.current = preCreatedAudioCtx;
+        if (preCreatedAudioCtx.state === 'suspended') {
+          preCreatedAudioCtx.resume().catch(() => {});
         }
       } catch {
-        // Fallback if microphone hardware is unavailable
+        preCreatedAudioCtx = null;
       }
     }
 
+    // Start local Linux Mint native ALSA microphone fallback listener (in case Firefox blocks/mutes mic on localhost)
+    fetch('/api/listen/start', { method: 'POST' }).catch(() => {});
+    if (nativePollTimerRef.current !== null) {
+      window.clearInterval(nativePollTimerRef.current);
+    }
+    nativePollTimerRef.current = window.setInterval(async () => {
+      if (!isListeningRef.current) return;
+      try {
+        const r = await fetch('/api/listen/poll', { cache: 'no-store' });
+        if (!r.ok) return;
+        const data = (await r.json()) as {
+          transcripts?: Array<{ text: string; confidence?: number }>;
+          rmsLevel?: number;
+        };
+        if (typeof data.rmsLevel === 'number' && data.rmsLevel > 0) {
+          setMicLevel((prev) => Math.max(prev, data.rmsLevel!));
+        }
+        if (Array.isArray(data.transcripts)) {
+          for (const item of data.transcripts) {
+            if (item.text?.trim()) {
+              webSpeechDeliveredRef.current = Date.now();
+              translateEnglishSpeech(item.text.trim(), 'deepgram', item.confidence ?? 0.95);
+            }
+          }
+        }
+      } catch {
+        // Endpoint only present in local .deb server or when reachable
+      }
+    }, 700);
+
+    const isRealDeviceId =
+      selectedMicId &&
+      selectedMicId !== 'default' &&
+      selectedMicId !== 'alsa-internal' &&
+      selectedMicId !== 'usb-headset';
+    const audioConstraint: MediaTrackConstraints = isRealDeviceId
+      ? {
+          deviceId: { ideal: selectedMicId },
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      : {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        };
+
+    // 1. Start Browser SpeechRecognition in parallel if supported
     const SpeechRec =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (SpeechRec) {
@@ -384,6 +327,7 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
           for (let i = event.resultIndex; i < event.results.length; i++) {
             const transcript = event.results[i][0].transcript;
             if (event.results[i].isFinal) {
+              webSpeechDeliveredRef.current = Date.now();
               translateEnglishSpeech(
                 transcript,
                 'webspeech',
@@ -393,24 +337,138 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
               interim += transcript;
             }
           }
-          setInterimEnglish(interim);
+          if (interim) {
+            setInterimEnglish(interim);
+          }
         };
+
+        recognition.onerror = () => {};
+
+        recognition.onend = () => {
+          if (isListeningRef.current && recognitionRef.current === recognition) {
+            try {
+              recognition.start();
+            } catch {}
+          }
+        };
+
         recognitionRef.current = recognition;
         recognition.start();
       } catch {}
     }
 
-    let idx = 0;
-    setInterimEnglish('Listening for English speech...');
-    demoTimerRef.current = window.setInterval(() => {
-      const phrase = DEMO_SPEECH_CUES[idx % DEMO_SPEECH_CUES.length];
-      idx++;
-      translateEnglishSpeech(phrase, 'deepgram', 0.99);
-    }, 4200);
+    // 2. Capture Selected Microphone Stream in Firefox / Chromium for 16kHz RIFF WAV Speech Framing
+    if (navigator.mediaDevices?.getUserMedia) {
+      try {
+        let stream: MediaStream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+        if (!isListeningRef.current) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        mediaStreamRef.current = stream;
+        loadAudioDevices().catch(() => {});
+
+        const audioCtx = preCreatedAudioCtx || (AudioCtx ? new AudioCtx() : null);
+        if (audioCtx) {
+          audioContextRef.current = audioCtx;
+          if (audioCtx.state === 'suspended') {
+            await audioCtx.resume().catch(() => {});
+          }
+          const sourceNode = audioCtx.createMediaStreamSource(stream);
+          const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+          // CRITICAL FOR FIREFOX: Store nodes in useRef so SpiderMonkey GC never collects them
+          sourceNodeRef.current = sourceNode;
+          processorNodeRef.current = processor;
+
+          let pcmChunks: Float32Array[] = [];
+          let totalSamples = 0;
+          let speechDetectedInWindow = false;
+          let lastSpeechTime = Date.now();
+          let uploadChain = Promise.resolve();
+
+          const uploadWavChunk = async (samplesToFlush: Float32Array, nativeSampleRate: number) => {
+            if (!isListeningRef.current || samplesToFlush.length < nativeSampleRate * 0.35) return;
+            if (Date.now() - webSpeechDeliveredRef.current < 1000) return;
+
+            const wavBytes = encodePcmToWav(samplesToFlush, nativeSampleRate, 16000);
+            const wavBlob = new Blob([wavBytes], { type: 'audio/wav' });
+
+            try {
+              const resp = await fetch('/api/deepgram/transcribe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'audio/wav' },
+                body: wavBlob,
+              });
+              if (resp.ok) {
+                const dg = await resp.json();
+                const text = dg.transcript?.trim();
+                if (text && Date.now() - webSpeechDeliveredRef.current >= 800) {
+                  translateEnglishSpeech(text, 'deepgram', dg.confidence ?? 0.96);
+                }
+              }
+            } catch {
+              // Ignore transient network error
+            }
+          };
+
+          processor.onaudioprocess = (audioEvt) => {
+            if (!isListeningRef.current) return;
+            if (audioCtx.state === 'suspended') {
+              audioCtx.resume().catch(() => {});
+            }
+            const inputData = audioEvt.inputBuffer.getChannelData(0);
+            const rms = computeRmsLevel(inputData);
+            const scaledLevel = Math.min(100, Math.round(Math.sqrt(rms) * 190));
+            setMicLevel(scaledLevel);
+
+            const now = Date.now();
+            const isSpeakingNow = rms > 0.0015;
+            if (isSpeakingNow) {
+              speechDetectedInWindow = true;
+              lastSpeechTime = now;
+            }
+
+            if (speechDetectedInWindow) {
+              const copy = new Float32Array(inputData.length);
+              copy.set(inputData);
+              pcmChunks.push(copy);
+              totalSamples += copy.length;
+
+              const durationSec = totalSamples / audioCtx.sampleRate;
+              const silenceMs = now - lastSpeechTime;
+
+              // Flush when speaker pauses for 420ms (after >= 0.45s speech) or reaches 2.5s phrase
+              if ((durationSec >= 0.45 && silenceMs >= 420) || durationSec >= 2.5) {
+                const merged = new Float32Array(totalSamples);
+                let offset = 0;
+                for (const c of pcmChunks) {
+                  merged.set(c, offset);
+                  offset += c.length;
+                }
+                pcmChunks = [];
+                totalSamples = 0;
+                speechDetectedInWindow = false;
+                const rate = audioCtx.sampleRate;
+                uploadChain = uploadChain
+                  .then(() => uploadWavChunk(merged, rate))
+                  .catch(() => {});
+              }
+            }
+          };
+
+          sourceNode.connect(processor);
+          processor.connect(audioCtx.destination);
+        }
+      } catch {
+        // If browser microphone permission is denied on localhost, native Linux Mint arecord listener continues in background
+      }
+    }
   }, [
-    deepgramApiKey,
-    hasServerKey,
-    isListening,
     loadAudioDevices,
     selectedMicId,
     translateEnglishSpeech,
@@ -419,26 +477,6 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
   useEffect(() => {
     return () => handleStopListening();
   }, [handleStopListening]);
-
-  const handleSaveApiKey = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      const resp = await fetch('/api/deepgram/key', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKey: deepgramApiKey.trim() }),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        setHasServerKey(Boolean(data.deepgramConfigured));
-      }
-    } catch {}
-    setApiKeySavedMsg(true);
-    setTimeout(() => {
-      setApiKeySavedMsg(false);
-      setIsApiKeyPanelOpen(false);
-    }, 900);
-  };
 
   const handleTestPhraseSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -455,70 +493,46 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
       className="min-h-screen bg-[#E0F2F1] text-[#0F3F3C] flex flex-col justify-between"
     >
       {/* Clean Minimalist Top Header */}
-      <header className="bg-[#CCFBF1] border-b border-teal-300/80 px-6 py-4 flex items-center justify-between gap-8">
-        <span className="text-xl font-extrabold tracking-tight text-[#0B3B38] whitespace-nowrap shrink-0">
+      <header className="bg-[#CCFBF1] border-b border-teal-300/80 px-6 py-3 flex items-center justify-between gap-8">
+        <span className="text-lg font-extrabold tracking-tight text-[#0B3B38] whitespace-nowrap shrink-0">
           JOI Subtitles 3.0
         </span>
 
-        <div className="text-xs font-medium text-teal-800 hidden sm:flex items-center gap-2 whitespace-nowrap">
+        <div className="text-xs font-medium text-teal-800 flex items-center gap-2 whitespace-nowrap">
           <span>English Speech → Romanian Text</span>
-          <span aria-hidden="true">·</span>
-          <span>Deepgram STT + Neural NMT</span>
+          <span aria-hidden="true" className="hidden sm:inline">·</span>
+          <span className="hidden sm:inline">Live Speech Recognition + Neural NMT</span>
           <span aria-hidden="true">·</span>
           <span>{isListening ? 'Status: Listening Live' : 'Status: Standby'}</span>
-        </div>
-
-        <div className="flex items-center gap-2.5 shrink-0">
-          {!isStandaloneInstalled && (
-            <button
-              type="button"
-              onClick={handleInstallStandaloneApp}
-              data-testid="install-standalone-btn"
-              className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold bg-white hover:bg-teal-50 text-[#0B3B38] border border-teal-400 transition-colors whitespace-nowrap cursor-pointer"
-            >
-              <Download className="w-3.5 h-3.5 text-[#0D9488]" />
-              <span>Install Standalone App</span>
-            </button>
-          )}
-
-          <button
-            type="button"
-            onClick={() => setIsCaptionWindowOpen((prev) => !prev)}
-            data-testid="toggle-caption-window-btn"
-            className="flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold bg-[#0D9488] hover:bg-[#0F766E] text-white transition-colors whitespace-nowrap cursor-pointer"
-          >
-            <AppWindow className="w-4 h-4" />
-            <span>{isCaptionWindowOpen ? 'Close Caption Window' : 'Open Caption Window'}</span>
-          </button>
         </div>
       </header>
 
       {/* Simple, Uncluttered Main Control Card */}
-      <main className="flex-1 w-full max-w-4xl mx-auto px-6 py-8 flex flex-col gap-6">
+      <main className="flex-1 w-full max-w-4xl mx-auto px-6 pt-4 pb-44 flex flex-col gap-3.5">
         {/* Primary Essential Control Bar */}
         <section
           aria-label="Primary Controls"
-          className="bg-[#F0FDFA] border border-teal-300 rounded-2xl p-6 shadow-xs space-y-5"
+          className="bg-[#F0FDFA] border border-teal-300 rounded-2xl p-4 shadow-xs space-y-3"
         >
-          <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h1 className="text-lg font-bold text-[#0B3B38]">
+              <h1 className="text-base font-bold text-[#0B3B38]">
                 Live Speech-to-Text Translation Controls
               </h1>
-              <p className="text-xs text-teal-800/80 mt-0.5">
+              <p className="text-xs text-teal-800/80">
                 Lightweight Linux Mint edition. Captions render in a separate window with a
                 transparent background.
               </p>
             </div>
 
-            {/* The 4 Essential Buttons */}
-            <div className="flex flex-wrap items-center gap-2.5">
+            {/* Primary Control Buttons */}
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={handleStartListening}
                 disabled={isListening}
                 data-testid="start-listening-btn"
-                className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold bg-[#0D9488] hover:bg-[#0F766E] disabled:opacity-45 text-white transition-colors cursor-pointer whitespace-nowrap"
+                className="flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold bg-[#0D9488] hover:bg-[#0F766E] disabled:opacity-45 text-white transition-colors cursor-pointer whitespace-nowrap"
               >
                 <Mic className="w-4 h-4" />
                 <span>Start Listening</span>
@@ -529,7 +543,7 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
                 onClick={handleStopListening}
                 disabled={!isListening}
                 data-testid="stop-listening-btn"
-                className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold bg-rose-600 hover:bg-rose-500 disabled:opacity-40 text-white transition-colors cursor-pointer whitespace-nowrap"
+                className="flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-500 disabled:opacity-40 text-white transition-colors cursor-pointer whitespace-nowrap"
               >
                 <Square className="w-4 h-4" />
                 <span>Stop</span>
@@ -537,19 +551,9 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
 
               <button
                 type="button"
-                onClick={() => setIsApiKeyPanelOpen((prev) => !prev)}
-                data-testid="enter-api-key-btn"
-                className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold bg-[#CCFBF1] hover:bg-teal-200 text-[#0B3B38] border border-teal-400 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <Key className="w-4 h-4" />
-                <span>Enter API Key</span>
-              </button>
-
-              <button
-                type="button"
                 onClick={() => setIsCaptionWindowOpen((prev) => !prev)}
                 data-testid="open-close-caption-btn"
-                className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold bg-teal-900 hover:bg-teal-800 text-teal-50 transition-colors cursor-pointer whitespace-nowrap"
+                className="flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold bg-teal-900 hover:bg-teal-800 text-teal-50 transition-colors cursor-pointer whitespace-nowrap"
               >
                 <AppWindow className="w-4 h-4" />
                 <span>
@@ -559,21 +563,34 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
             </div>
           </div>
 
-          {/* Microphone Selector Row */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-teal-200/80">
-            <label
-              htmlFor="microphone-select"
-              className="text-xs font-semibold text-teal-900 whitespace-nowrap"
-            >
-              Microphone
-            </label>
+          {/* Microphone Selector Row + Live Input Level Meter */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pt-2.5 border-t border-teal-200/80">
+            <div className="flex items-center gap-3">
+              <label
+                htmlFor="microphone-select"
+                className="text-xs font-semibold text-teal-900 whitespace-nowrap"
+              >
+                Microphone
+              </label>
+              {isListening && (
+                <div
+                  className="w-20 h-2 bg-teal-200 rounded-full overflow-hidden"
+                  title="Live Microphone Input Level"
+                >
+                  <div
+                    className="h-full bg-[#0D9488] transition-all duration-75"
+                    style={{ width: `${Math.max(8, micLevel)}%` }}
+                  />
+                </div>
+              )}
+            </div>
             <select
               id="microphone-select"
               data-testid="microphone-select"
               value={selectedMicId}
               onChange={(e) => setSelectedMicId(e.target.value)}
               onClick={() => loadAudioDevices()}
-              className="flex-1 max-w-md px-3 py-2 text-xs font-medium rounded-xl bg-white border border-teal-300 text-[#0F3F3C] focus:outline-none focus:border-teal-600 cursor-pointer"
+              className="flex-1 max-w-md px-3 py-1.5 text-xs font-medium rounded-xl bg-white border border-teal-300 text-[#0F3F3C] focus:outline-none focus:border-teal-600 cursor-pointer"
             >
               {microphones.map((mic) => (
                 <option key={mic.deviceId} value={mic.deviceId}>
@@ -583,44 +600,8 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
             </select>
           </div>
 
-          {/* Collapsible Enter API Key Panel */}
-          {isApiKeyPanelOpen && (
-            <form
-              onSubmit={handleSaveApiKey}
-              data-testid="api-key-panel"
-              className="p-4 rounded-xl bg-[#E0F2F1] border border-teal-300 flex flex-col sm:flex-row items-stretch sm:items-center gap-3"
-            >
-              <label htmlFor="deepgram-key-input" className="text-xs font-bold text-[#0B3B38] whitespace-nowrap">
-                Deepgram API Key:
-              </label>
-              <input
-                id="deepgram-key-input"
-                data-testid="deepgram-key-input"
-                type="password"
-                value={deepgramApiKey}
-                onChange={(e) => setDeepgramApiKey(e.target.value)}
-                placeholder="Paste your Deepgram API key..."
-                className="flex-1 px-3 py-2 text-xs rounded-lg bg-white border border-teal-300 text-[#0F3F3C] placeholder:text-teal-700/50 focus:outline-none focus:border-teal-600"
-              />
-              <button
-                type="submit"
-                data-testid="save-api-key-btn"
-                className="flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-[#0D9488] hover:bg-[#0F766E] text-white cursor-pointer whitespace-nowrap"
-              >
-                {apiKeySavedMsg ? (
-                  <>
-                    <Check className="w-3.5 h-3.5" />
-                    <span>Saved</span>
-                  </>
-                ) : (
-                  <span>Save API Key</span>
-                )}
-              </button>
-            </form>
-          )}
-
           {/* Compact Subtitle Size & Background Opacity Bar (No parenthetical text) */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-3 border-t border-teal-200/80">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2.5 border-t border-teal-200/80">
             <div className="flex items-center justify-between gap-3">
               <label htmlFor="joi-font-size" className="text-xs font-semibold text-teal-900 whitespace-nowrap">
                 Caption Text Size
@@ -656,7 +637,7 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
         </section>
 
         {/* Simple Live Speech Input & Recent Translations */}
-        <section className="bg-[#F0FDFA] border border-teal-300 rounded-2xl p-6 shadow-xs space-y-4">
+        <section className="bg-[#F0FDFA] border border-teal-300 rounded-2xl p-4 shadow-xs space-y-2.5">
           <form onSubmit={handleTestPhraseSubmit} className="flex items-center gap-2.5">
             <label htmlFor="english-speech-input" className="sr-only">
               Type English speech to translate to Romanian
@@ -668,19 +649,19 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
               value={testInput}
               onChange={(e) => setTestInput(e.target.value)}
               placeholder="Speak into microphone or type English speech here to display in the Caption Window..."
-              className="flex-1 px-3.5 py-2.5 text-sm rounded-xl bg-white border border-teal-300 text-[#0F3F3C] placeholder:text-teal-700/50 focus:outline-none focus:border-teal-600"
+              className="flex-1 px-3 py-2 text-xs rounded-xl bg-white border border-teal-300 text-[#0F3F3C] placeholder:text-teal-700/50 focus:outline-none focus:border-teal-600"
             />
             <button
               type="submit"
               data-testid="translate-submit-btn"
-              className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-xs font-bold bg-[#0D9488] hover:bg-[#0F766E] text-white transition-colors cursor-pointer whitespace-nowrap"
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold bg-[#0D9488] hover:bg-[#0F766E] text-white transition-colors cursor-pointer whitespace-nowrap"
             >
               <Send className="w-3.5 h-3.5" />
               <span>Translate</span>
             </button>
           </form>
 
-          <div className="space-y-2 max-h-48 overflow-y-auto pr-1" data-testid="transcript-list">
+          <div className="space-y-1.5 max-h-24 overflow-y-auto pr-1" data-testid="transcript-list">
             {segments
               .slice()
               .reverse()
@@ -692,10 +673,10 @@ echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Applicati
                     setCurrentRomanian(seg.romanian);
                     setIsCaptionWindowOpen(true);
                   }}
-                  className="px-3.5 py-2.5 rounded-xl bg-[#E0F2F1]/70 hover:bg-[#CCFBF1] border border-teal-300/70 cursor-pointer transition-colors"
+                  className="px-3 py-1.5 rounded-xl bg-[#E0F2F1]/70 hover:bg-[#CCFBF1] border border-teal-300/70 cursor-pointer transition-colors"
                 >
-                  <p className="text-xs text-teal-800">{seg.english}</p>
-                  <p className="text-sm font-bold text-[#0B3B38]">{seg.romanian}</p>
+                  <p className="text-[11px] text-teal-800 truncate">{seg.english}</p>
+                  <p className="text-xs font-bold text-[#0B3B38] truncate">{seg.romanian}</p>
                 </div>
               ))}
           </div>

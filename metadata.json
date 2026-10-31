@@ -1,0 +1,6 @@
+{
+  "name": "MintCaption RO — Live English-to-Romanian Presentation Subtitles",
+  "description": "Ultra-lightweight English speech to Romanian text live captioning app built for Linux Mint presentations with Deepgram STT, MyMemory Translation API, always-on-top PiP overlay, color wheels, and subtitle opacity/size controls.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

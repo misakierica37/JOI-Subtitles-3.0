@@ -1,0 +1,31 @@
+{
+  "id": "/",
+  "name": "JOI Subtitles 3.0",
+  "short_name": "JOI Sub 3.0",
+  "description": "Standalone English speech to Romanian text live captioning application for Linux Mint.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#E0F2F1",
+  "theme_color": "#CCFBF1",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

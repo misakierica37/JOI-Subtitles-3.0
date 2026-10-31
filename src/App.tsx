@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, Square, Key, AppWindow, Send, Check } from 'lucide-react';
+import { Mic, Square, Key, AppWindow, Send, Check, Download } from 'lucide-react';
 import {
   type TranscriptSegment,
   DEFAULT_CUSTOMIZATION,
@@ -8,6 +8,11 @@ import {
   normalizeSpeechChunk,
 } from './utils/translationLogic';
 import { SeparateCaptionWindow } from './components/SeparateCaptionWindow';
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
 
 export interface AudioInputDevice {
   deviceId: string;
@@ -64,6 +69,8 @@ export default function App() {
   const [deepgramApiKey, setDeepgramApiKey] = useState<string>('');
   const [apiKeySavedMsg, setApiKeySavedMsg] = useState<boolean>(false);
   const [hasServerKey, setHasServerKey] = useState<boolean>(false);
+  const [deferredPwaPrompt, setDeferredPwaPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+  const [isStandaloneInstalled, setIsStandaloneInstalled] = useState<boolean>(false);
 
   // Microphone selection state
   const [microphones, setMicrophones] = useState<AudioInputDevice[]>(DEFAULT_FALLBACK_MICS);
@@ -87,6 +94,91 @@ export default function App() {
   const recognitionRef = useRef<any>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const demoTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const standalone =
+      window.matchMedia('(display-mode: standalone)').matches ||
+      (window.navigator as unknown as { standalone?: boolean }).standalone === true;
+    setIsStandaloneInstalled(standalone);
+
+    const onBeforeInstall = (e: Event) => {
+      e.preventDefault();
+      setDeferredPwaPrompt(e as BeforeInstallPromptEvent);
+    };
+    const onInstalled = () => {
+      setIsStandaloneInstalled(true);
+      setDeferredPwaPrompt(null);
+    };
+    window.addEventListener('beforeinstallprompt', onBeforeInstall);
+    window.addEventListener('appinstalled', onInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', onBeforeInstall);
+      window.removeEventListener('appinstalled', onInstalled);
+    };
+  }, []);
+
+  const handleInstallStandaloneApp = async () => {
+    if (deferredPwaPrompt) {
+      await deferredPwaPrompt.prompt();
+      const { outcome } = await deferredPwaPrompt.userChoice;
+      if (outcome === 'accepted') {
+        setIsStandaloneInstalled(true);
+        setDeferredPwaPrompt(null);
+        return;
+      }
+    }
+    // Download the self-contained Linux Mint standalone installer script (.sh)
+    const appOrigin =
+      typeof window !== 'undefined'
+        ? window.location.origin
+        : 'https://ais-pre-qctleytd22ucn4li4oik5s-401889023177.europe-west2.run.app';
+    const installerScript = `#!/usr/bin/env bash
+# JOI Subtitles 3.0 — One-Step Standalone Installer for Linux Mint (Celeron N2940 4GB)
+set -e
+echo "Installing JOI Subtitles 3.0 Standalone Desktop App..."
+sudo apt-get update -y && sudo apt-get install -y nodejs npm wmctrl xdotool curl
+mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+
+cat << 'EOF' > "$HOME/.local/bin/joi-subtitles"
+#!/usr/bin/env bash
+URL="${appOrigin}"
+for bin in chromium-browser chromium google-chrome-stable brave-browser firefox; do
+  if command -v "$bin" >/dev/null 2>&1; then
+    "$bin" --app="$URL" --window-size=1020,760 --disable-extensions --renderer-process-limit=2 &
+    break
+  fi
+done
+sleep 2
+command -v wmctrl >/dev/null 2>&1 && wmctrl -r "JOI Subtitles 3.0" -b add,above,sticky || true
+EOF
+chmod +x "$HOME/.local/bin/joi-subtitles"
+
+cat << EOF > "$HOME/.local/share/applications/joi-subtitles-3.desktop"
+[Desktop Entry]
+Version=3.0
+Type=Application
+Name=JOI Subtitles 3.0
+Comment=Live English Speech to Romanian Text Subtitles
+Exec=$HOME/.local/bin/joi-subtitles
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Utility;
+EOF
+chmod +x "$HOME/.local/share/applications/joi-subtitles-3.desktop"
+[ -d "$HOME/Desktop" ] && cp "$HOME/.local/share/applications/joi-subtitles-3.desktop" "$HOME/Desktop/JOI-Subtitles-3.0.desktop" && chmod +x "$HOME/Desktop/JOI-Subtitles-3.0.desktop"
+echo "Done! Launch 'JOI Subtitles 3.0' from your Linux Mint Desktop or Application Menu."
+`;
+    const blob = new Blob([installerScript], { type: 'text/x-shellscript;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'install-joi-subtitles.sh';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
 
   const loadAudioDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -376,15 +468,29 @@ export default function App() {
           <span>{isListening ? 'Status: Listening Live' : 'Status: Standby'}</span>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setIsCaptionWindowOpen((prev) => !prev)}
-          data-testid="toggle-caption-window-btn"
-          className="flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold bg-[#0D9488] hover:bg-[#0F766E] text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-        >
-          <AppWindow className="w-4 h-4" />
-          <span>{isCaptionWindowOpen ? 'Close Caption Window' : 'Open Caption Window'}</span>
-        </button>
+        <div className="flex items-center gap-2.5 shrink-0">
+          {!isStandaloneInstalled && (
+            <button
+              type="button"
+              onClick={handleInstallStandaloneApp}
+              data-testid="install-standalone-btn"
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold bg-white hover:bg-teal-50 text-[#0B3B38] border border-teal-400 transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <Download className="w-3.5 h-3.5 text-[#0D9488]" />
+              <span>Install Standalone App</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => setIsCaptionWindowOpen((prev) => !prev)}
+            data-testid="toggle-caption-window-btn"
+            className="flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold bg-[#0D9488] hover:bg-[#0F766E] text-white transition-colors whitespace-nowrap cursor-pointer"
+          >
+            <AppWindow className="w-4 h-4" />
+            <span>{isCaptionWindowOpen ? 'Close Caption Window' : 'Open Caption Window'}</span>
+          </button>
+        </div>
       </header>
 
       {/* Simple, Uncluttered Main Control Card */}
